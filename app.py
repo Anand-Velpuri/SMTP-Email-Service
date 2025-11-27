@@ -131,7 +131,7 @@ class Settings:
     SMTP_SERVER: str = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
     # 465 for SSL, 587 for TLS
     SMTP_PORT: int = int(os.environ.get("SMTP_PORT", 465)) 
-    SENDER_EMAIL: EmailStr = os.environ.get("SENDER_EMAIL", "velpurianand8005@gmail.com")
+    SENDER_EMAIL: EmailStr = os.environ.get("SENDER_EMAIL", "satyasaidistrictpolice@gmail.com")
     # For security, use an App Password if using services like Gmail
     PASSWORD: str = os.environ.get("SENDER_PASSWORD")
 
