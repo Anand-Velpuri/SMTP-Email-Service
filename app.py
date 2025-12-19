@@ -266,3 +266,12 @@ async def send_otp(request: OtpEmailRequest = Body(...)):
         # Catch unexpected errors
         logger.error(f"Endpoint failure: {e}")
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred.")
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=7860, reload=True)
