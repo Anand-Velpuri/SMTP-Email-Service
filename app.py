@@ -16,7 +16,6 @@ from fastapi import (
     UploadFile,
     File,
     Form,
-    Request,
     Body,
 )
 from fastapi.responses import HTMLResponse
@@ -31,16 +30,13 @@ class Settings:
     SMTP_SERVER: str = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
     SMTP_PORT: int = int(os.environ.get("SMTP_PORT", "587"))
 
-    SENDER_EMAIL: str = os.environ.get(
-        "SENDER_EMAIL",
-        "satyasaidistrictpolice@gmail.com"
-    )
+    SENDER_EMAIL: str = os.environ.get("SENDER_EMAIL", "")
 
     PASSWORD: str | None = os.environ.get("SENDER_PASSWORD")
 
     SENDER_NAME: str = os.environ.get(
         "SENDER_NAME",
-        "Hostel Management System"
+        "Email Service"
     )
 
 
@@ -138,6 +134,11 @@ def normalize_recipients(raw_recipients: str) -> List[str]:
 # ============================================================
 
 def create_smtp_connection():
+    if not settings.SENDER_EMAIL:
+        raise ValueError(
+            "SENDER_EMAIL environment variable is not configured."
+        )
+
     if not settings.PASSWORD:
         raise ValueError(
             "SENDER_PASSWORD environment variable is not configured."
@@ -244,25 +245,22 @@ def send_bulk_email_sync(
     subject: str,
     html_body: str,
     plain_body: str,
-    attachments: list[dict]
+    attachments: list[dict],
+    progress_callback=None
 ):
-
     results = []
-
     server = None
+    total = len(recipients)
 
     try:
-
         server = create_smtp_connection()
 
         for index, recipient in enumerate(recipients, start=1):
-
             try:
-
                 logger.info(
                     "Sending %s/%s -> %s",
                     index,
-                    len(recipients),
+                    total,
                     recipient
                 )
 
@@ -276,21 +274,26 @@ def send_bulk_email_sync(
 
                 server.send_message(msg)
 
-                results.append({
+                result = {
                     "email": recipient,
                     "success": True,
                     "error": None
-                })
+                }
+
+                results.append(result)
 
                 logger.info(
-                    "Successfully sent -> %s",
+                    "Successfully sent %s/%s -> %s",
+                    index,
+                    total,
                     recipient
                 )
 
             except Exception as e:
-
                 logger.error(
-                    "Failed -> %s : %s",
+                    "Failed %s/%s -> %s : %s",
+                    index,
+                    total,
                     recipient,
                     e
                 )
@@ -301,12 +304,18 @@ def send_bulk_email_sync(
                     "error": str(e)
                 })
 
+            if progress_callback:
+                progress_callback(
+                    index,
+                    total,
+                    recipient,
+                    results[-1]
+                )
+
         return results
 
     finally:
-
         if server:
-
             try:
                 server.quit()
             except Exception:
@@ -317,6 +326,75 @@ def send_bulk_email_sync(
 # BULK API
 # ============================================================
 
+# In-memory job store.
+# Suitable for a single Vercel instance/request lifecycle.
+# For large or long-running campaigns, use a persistent queue/database.
+bulk_jobs = {}
+
+
+def run_bulk_job(
+    job_id: str,
+    recipients: List[str],
+    subject: str,
+    html_body: str,
+    plain_body: str,
+    attachments: list[dict]
+):
+    bulk_jobs[job_id]["status"] = "sending"
+
+    # Keep the authoritative result list separate so the callback can
+    # update the UI without duplicating entries.
+    actual_results = []
+
+    def tracked_progress(index, total, recipient, result):
+        actual_results.append(result)
+
+        successful = sum(1 for item in actual_results if item["success"])
+        failed = len(actual_results) - successful
+
+        bulk_jobs[job_id].update({
+            "processed": index,
+            "total": total,
+            "successful": successful,
+            "failed": failed,
+            "current_email": recipient,
+            "current_success": result["success"],
+            "results": list(actual_results)
+        })
+
+    try:
+        results = send_bulk_email_sync(
+            recipients=recipients,
+            subject=subject,
+            html_body=html_body,
+            plain_body=plain_body,
+            attachments=attachments,
+            progress_callback=tracked_progress
+        )
+
+        successful = sum(1 for result in results if result["success"])
+        failed = len(results) - successful
+
+        bulk_jobs[job_id].update({
+            "status": "completed",
+            "processed": len(results),
+            "total": len(results),
+            "successful": successful,
+            "failed": failed,
+            "current_email": None,
+            "current_success": None,
+            "results": results
+        })
+
+    except Exception as e:
+        logger.exception("Bulk email job failed: %s", job_id)
+
+        bulk_jobs[job_id].update({
+            "status": "failed",
+            "error": str(e)
+        })
+
+
 @app.post("/send-bulk")
 async def send_bulk(
     recipients: str = Form(...),
@@ -325,7 +403,6 @@ async def send_bulk(
     plain_body: str = Form(""),
     attachments: List[UploadFile] = File(default=[])
 ):
-
     recipient_list = normalize_recipients(recipients)
 
     if not recipient_list:
@@ -346,14 +423,9 @@ async def send_bulk(
             detail="Email body is required."
         )
 
-    # --------------------------------------------------------
-    # Read attachments into memory
-    # --------------------------------------------------------
-
     attachment_data = []
 
     for attachment in attachments:
-
         if not attachment.filename:
             continue
 
@@ -364,39 +436,52 @@ async def send_bulk(
             "content": content
         })
 
-    logger.info(
-        "Bulk email started: %s recipients, %s attachments",
-        len(recipient_list),
-        len(attachment_data)
+    import uuid
+
+    job_id = uuid.uuid4().hex
+
+    bulk_jobs[job_id] = {
+        "status": "queued",
+        "processed": 0,
+        "total": len(recipient_list),
+        "successful": 0,
+        "failed": 0,
+        "current_email": None,
+        "current_success": None,
+        "results": [],
+        "error": None
+    }
+
+    asyncio.create_task(
+        asyncio.to_thread(
+            run_bulk_job,
+            job_id,
+            recipient_list,
+            subject,
+            html_body,
+            plain_body,
+            attachment_data
+        )
     )
-
-    # --------------------------------------------------------
-    # Run SMTP work outside async event loop
-    # --------------------------------------------------------
-
-    results = await asyncio.to_thread(
-        send_bulk_email_sync,
-        recipient_list,
-        subject,
-        html_body,
-        plain_body,
-        attachment_data
-    )
-
-    successful = sum(
-        1 for result in results
-        if result["success"]
-    )
-
-    failed = len(results) - successful
 
     return {
-        "message": "Bulk email completed.",
-        "total": len(results),
-        "successful": successful,
-        "failed": failed,
-        "results": results
+        "message": "Bulk email job started.",
+        "job_id": job_id,
+        "total": len(recipient_list)
     }
+
+
+@app.get("/bulk-progress/{job_id}")
+async def bulk_progress(job_id: str):
+    job = bulk_jobs.get(job_id)
+
+    if not job:
+        raise HTTPException(
+            status_code=404,
+            detail="Bulk email job not found."
+        )
+
+    return job
 
 
 # ============================================================
@@ -407,11 +492,10 @@ def send_otp_email_sync(
     to_email: str,
     otp: str
 ) -> bool:
-
-    subject = "Your Hostel Management OTP Code"
+    subject = "Your Verification Code"
 
     plain_body = (
-        f"Your One-Time Password (OTP) is: {otp}\n\n"
+        f"Your verification code is: {otp}\\n\\n"
         "This code will expire in 10 minutes."
     )
 
@@ -423,7 +507,6 @@ def send_otp_email_sync(
         background: #f5f5f5;
         padding: 30px;
     ">
-
         <div style="
             max-width: 600px;
             margin: auto;
@@ -432,10 +515,9 @@ def send_otp_email_sync(
             border-radius: 12px;
             border: 1px solid #ddd;
         ">
+            <h2>Email Verification</h2>
 
-            <h2>Hostel Management System</h2>
-
-            <p>Your One-Time Password (OTP) is:</p>
+            <p>Your verification code is:</p>
 
             <div style="
                 font-size: 32px;
@@ -449,12 +531,16 @@ def send_otp_email_sync(
                 {otp}
             </div>
 
-            <p>
-                This code will expire in 10 minutes.
+            <p>This code will expire in 10 minutes.</p>
+
+            <p style="
+                color: #777;
+                font-size: 13px;
+            ">
+                If you did not request this code, you can safely ignore
+                this email.
             </p>
-
         </div>
-
     </body>
     </html>
     """
@@ -543,7 +629,7 @@ HTML_PAGE = r"""
     content="width=device-width, initial-scale=1.0"
 >
 
-<title>Bulk Mailer</title>
+<title>Email Service</title>
 
 <style>
 
@@ -954,6 +1040,49 @@ button {
     font-weight: 400;
 }
 
+
+.progress-container {
+    display: none;
+    margin-top: 24px;
+}
+
+.progress-container.visible {
+    display: block;
+}
+
+.progress-header {
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 8px;
+    font-size: 13px;
+    color: var(--muted);
+}
+
+.progress-track {
+    width: 100%;
+    height: 10px;
+    background: rgba(127,127,127,0.16);
+    border-radius: 999px;
+    overflow: hidden;
+}
+
+.progress-bar {
+    width: 0%;
+    height: 100%;
+    background: var(--primary);
+    border-radius: inherit;
+    transition: width 0.25s ease;
+}
+
+.progress-current {
+    margin-top: 10px;
+    font-size: 13px;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
 </style>
 
 </head>
@@ -964,10 +1093,10 @@ button {
 
     <div class="header">
 
-        <h1>Bulk Mailer</h1>
+        <h1>Email Service</h1>
 
         <p>
-            Send personalized bulk emails with multiple attachments.
+            Send emails to multiple recipients with attachments.
         </p>
 
     </div>
@@ -1049,7 +1178,8 @@ person3@example.com"
                 ></textarea>
 
                 <div class="help">
-                    You can use HTML formatting here.
+                    Use HTML to format your email. A plain-text version
+                    is recommended for compatibility.
                 </div>
 
             </div>
@@ -1111,6 +1241,22 @@ person3@example.com"
             </div>
 
         </form>
+
+
+        <div class="progress-container" id="progressContainer">
+            <div class="progress-header">
+                <span id="progressLabel">Preparing...</span>
+                <span id="progressPercent">0%</span>
+            </div>
+
+            <div class="progress-track">
+                <div class="progress-bar" id="progressBar"></div>
+            </div>
+
+            <div class="progress-current" id="progressCurrent">
+                Waiting to start...
+            </div>
+        </div>
 
 
         <div
@@ -1382,30 +1528,106 @@ function showStatus(
 }
 
 
+async function pollBulkProgress(jobId) {
+    const progressContainer =
+        document.getElementById("progressContainer");
+
+    const progressBar =
+        document.getElementById("progressBar");
+
+    const progressLabel =
+        document.getElementById("progressLabel");
+
+    const progressPercent =
+        document.getElementById("progressPercent");
+
+    const progressCurrent =
+        document.getElementById("progressCurrent");
+
+    progressContainer.classList.add("visible");
+
+    while (true) {
+        const response = await fetch(
+            `/bulk-progress/${jobId}`,
+            { cache: "no-store" }
+        );
+
+        const data = await response.json();
+
+        if (!response.ok) {
+            throw new Error(
+                data.detail || "Unable to read sending progress."
+            );
+        }
+
+        const total = data.total || 0;
+        const processed = data.processed || 0;
+
+        const percent = total
+            ? Math.round((processed / total) * 100)
+            : 0;
+
+        progressBar.style.width = `${percent}%`;
+        progressPercent.textContent = `${percent}%`;
+
+        progressLabel.textContent =
+            `${processed} of ${total} emails processed`;
+
+        if (data.current_email) {
+            progressCurrent.textContent =
+                data.current_success === false
+                    ? `Failed: ${data.current_email}`
+                    : `Sending: ${data.current_email}`;
+        }
+
+        if (data.status === "completed") {
+            progressBar.style.width = "100%";
+            progressPercent.textContent = "100%";
+            progressLabel.textContent =
+                `${data.successful} sent, ${data.failed} failed`;
+
+            progressCurrent.textContent =
+                "Bulk sending completed.";
+
+            showStatus(
+                `Completed: ${data.successful} sent, ${data.failed} failed.`,
+                data.failed === 0 ? "success" : "error",
+                data.results || []
+            );
+
+            return;
+        }
+
+        if (data.status === "failed") {
+            throw new Error(
+                data.error || "Bulk email job failed."
+            );
+        }
+
+        await new Promise(
+            resolve => setTimeout(resolve, 500)
+        );
+    }
+}
+
+
 form.addEventListener(
     "submit",
     async event => {
-
         event.preventDefault();
 
         const recipients =
-            parseRecipients(
-                recipientsInput.value
-            );
+            parseRecipients(recipientsInput.value);
 
         if (!recipients.length) {
-
             showStatus(
                 "Please enter at least one valid recipient.",
                 "error"
             );
-
             return;
-
         }
 
-        const formData =
-            new FormData();
+        const formData = new FormData();
 
         formData.append(
             "recipients",
@@ -1427,80 +1649,84 @@ form.addEventListener(
             document.getElementById("htmlBody").value
         );
 
-
-        selectedFiles.forEach(
-            file => {
-
-                formData.append(
-                    "attachments",
-                    file,
-                    file.name
-                );
-
-            }
-        );
-
+        selectedFiles.forEach(file => {
+            formData.append(
+                "attachments",
+                file,
+                file.name
+            );
+        });
 
         sendButton.disabled = true;
+        clearButton.disabled = true;
+        sendButton.textContent = "Starting...";
 
-        sendButton.textContent =
-            "Sending...";
+        statusBox.className = "status";
+        statusBox.innerHTML = "";
 
-        statusBox.className =
-            "status";
+        const progressContainer =
+            document.getElementById("progressContainer");
+
+        const progressBar =
+            document.getElementById("progressBar");
+
+        const progressLabel =
+            document.getElementById("progressLabel");
+
+        const progressPercent =
+            document.getElementById("progressPercent");
+
+        const progressCurrent =
+            document.getElementById("progressCurrent");
+
+        progressContainer.classList.add("visible");
+        progressBar.style.width = "0%";
+        progressLabel.textContent =
+            `0 of ${recipients.length} emails processed`;
+        progressPercent.textContent = "0%";
+        progressCurrent.textContent =
+            "Starting bulk send...";
 
         try {
-
-            const response =
-                await fetch(
-                    "/send-bulk",
-                    {
-                        method: "POST",
-                        body: formData
-                    }
-                );
-
-            const data =
-                await response.json();
-
-
-            if (!response.ok) {
-
-                throw new Error(
-                    data.detail ||
-                    "Failed to send emails."
-                );
-
-            }
-
-
-            showStatus(
-                `Completed: ${data.successful} sent, ${data.failed} failed.`,
-                data.failed === 0
-                    ? "success"
-                    : "error",
-                data.results
+            const response = await fetch(
+                "/send-bulk",
+                {
+                    method: "POST",
+                    body: formData
+                }
             );
 
-        } catch (error) {
+            const data = await response.json();
 
+            if (!response.ok) {
+                throw new Error(
+                    data.detail ||
+                    "Failed to start bulk email."
+                );
+            }
+
+            sendButton.textContent = "Sending...";
+
+            await pollBulkProgress(data.job_id);
+
+        } catch (error) {
             showStatus(
                 error.message ||
                 "An unexpected error occurred.",
                 "error"
             );
 
+            progressCurrent.textContent =
+                "Sending stopped.";
+
         } finally {
-
             sendButton.disabled = false;
-
-            sendButton.textContent =
-                "Send to All";
-
+            clearButton.disabled = false;
+            sendButton.textContent = "Send to All";
         }
-
     }
 );
+
 
 
 clearButton.addEventListener(
